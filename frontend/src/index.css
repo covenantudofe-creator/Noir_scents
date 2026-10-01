@@ -132,6 +132,23 @@ a {
   gap: 8px;
 }
 
+.account-button {
+  border: 1px solid #b79b67;
+  border-radius: 999px;
+  padding: 9px 14px;
+  background: transparent;
+  color: #f5f2ec;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.account-button:hover {
+  background: #b79b67;
+  color: #0b0b0b;
+}
+
 .header-icon,
 .mobile-menu-button {
   position: relative;
@@ -1270,6 +1287,49 @@ a {
   align-items: center;
   justify-content: center;
   overflow-y: auto;
+}
+
+.auth-backdrop {
+  z-index: 600;
+  display: grid;
+  place-items: center;
+}
+
+.auth-dialog {
+  position: relative;
+  width: min(440px, 100%);
+  padding: 44px 34px 36px;
+  border: 1px solid #38342c;
+  background: #111;
+  text-align: center;
+  box-shadow: 0 20px 70px rgba(0, 0, 0, 0.45);
+}
+
+.auth-dialog h2 {
+  margin: 12px 0;
+  font-family: Georgia, serif;
+  font-size: 28px;
+  font-weight: 400;
+}
+
+.auth-dialog-copy {
+  margin: 0 auto 24px;
+  color: #aaa;
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+.google-signin-button {
+  display: flex;
+  min-height: 42px;
+  justify-content: center;
+}
+
+.auth-error {
+  margin: 16px 0 0;
+  color: #f2a19a;
+  font-size: 13px;
+  line-height: 1.5;
 }
 
 .product-modal {

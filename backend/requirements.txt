@@ -7,3 +7,5 @@ pydantic[email]
 cryptography
 sqlalchemy
 psycopg[binary]
+google-auth
+python-jose[cryptography]

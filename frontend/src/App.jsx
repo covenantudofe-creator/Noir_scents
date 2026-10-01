@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useState } from "react";
 
 const API_URL = (import.meta.env.VITE_API_URL || "http://127.0.0.1:8000").replace(/\/$/, "");
+const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || "";
 
 const FALLBACK_IMAGE =
   "https://images.unsplash.com/photo-1594035910387-fea47794261f?auto=format&fit=crop&w=800&q=85";
@@ -364,7 +365,7 @@ function ProductCard({
             disabled={isOutOfStock}
             onClick={() => onAddToCart(product)}
           >
-            {isOutOfStock ? "Sold Out" : "Add to Bag"}
+            {isOutOfStock ? "Sold Out" : "Add to Cart"}
           </button>
         </div>
       </div>
@@ -462,6 +463,10 @@ export default function App() {
     useState("");
   const [orderSubmitting, setOrderSubmitting] = useState(false);
   const [orderError, setOrderError] = useState("");
+  const [authDialogOpen, setAuthDialogOpen] = useState(false);
+  const [authUser, setAuthUser] = useState(null);
+  const [authError, setAuthError] = useState("");
+  const [authLoading, setAuthLoading] = useState(false);
 
   const [paymentMethod, setPaymentMethod] =
     useState("paystack");
@@ -475,6 +480,91 @@ export default function App() {
       city: "",
       state: "",
     });
+
+  useEffect(() => {
+    const token = sessionStorage.getItem("noir_session");
+    if (!token) return;
+
+    fetch(`${API_URL}/api/auth/me`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+      .then(readApiResponse)
+      .then((user) => {
+        setAuthUser(user);
+        setCheckoutForm((current) => ({
+          ...current,
+          customer_name: current.customer_name || user.name || "",
+          customer_email: current.customer_email || user.email || "",
+        }));
+      })
+      .catch(() => {
+        sessionStorage.removeItem("noir_session");
+      });
+  }, []);
+
+  useEffect(() => {
+    if (!authDialogOpen || !GOOGLE_CLIENT_ID) return;
+
+    const initializeGoogleButton = () => {
+      const buttonContainer = document.getElementById("google-signin-button");
+      if (!buttonContainer || !window.google?.accounts?.id) return;
+      window.google.accounts.id.initialize({
+        client_id: GOOGLE_CLIENT_ID,
+        callback: async ({ credential }) => {
+          setAuthLoading(true);
+          setAuthError("");
+          try {
+            const response = await fetch(`${API_URL}/api/auth/google`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ credential }),
+            });
+            const result = await readApiResponse(response);
+            sessionStorage.setItem("noir_session", result.access_token);
+            setAuthUser(result.user);
+            setCheckoutForm((current) => ({
+              ...current,
+              customer_name: current.customer_name || result.user.name || "",
+              customer_email: current.customer_email || result.user.email || "",
+            }));
+            setAuthDialogOpen(false);
+          } catch (error) {
+            setAuthError(error.message || "Google sign-in failed. Please try again.");
+          } finally {
+            setAuthLoading(false);
+          }
+        },
+      });
+      buttonContainer.replaceChildren();
+      window.google.accounts.id.renderButton(buttonContainer, {
+        theme: "outline",
+        size: "large",
+        text: "continue_with",
+        shape: "rectangular",
+        width: 280,
+      });
+    };
+
+    let script = document.getElementById("google-identity-services");
+    if (window.google?.accounts?.id) {
+      initializeGoogleButton();
+    } else {
+      if (!script) {
+        script = document.createElement("script");
+        script.id = "google-identity-services";
+        script.src = "https://accounts.google.com/gsi/client";
+        script.async = true;
+        script.defer = true;
+        document.head.appendChild(script);
+      }
+      script.addEventListener("load", initializeGoogleButton, { once: true });
+    }
+  }, [authDialogOpen]);
+
+  function signOut() {
+    sessionStorage.removeItem("noir_session");
+    setAuthUser(null);
+  }
 
   /*
   ============================================================
@@ -2133,7 +2223,7 @@ export default function App() {
               }}
             >
               {inStock
-                ? "Add to Bag"
+                ? "Add to Cart"
                 : "Sold Out"}
 
               <ShoppingBagIcon />
@@ -2377,6 +2467,15 @@ export default function App() {
           </nav>
 
           <div className="header-actions">
+            {authUser ? (
+              <button className="account-button" onClick={signOut} title={`Signed in as ${authUser.email}`}>
+                {authUser.name?.split(" ")[0] || "Account"} · Sign out
+              </button>
+            ) : (
+              <button className="account-button" onClick={() => { setAuthError(""); setAuthDialogOpen(true); }}>
+                Sign in
+              </button>
+            )}
             <button
               className="header-icon"
               onClick={() =>
@@ -2480,6 +2579,32 @@ export default function App() {
       <Footer />
 
       <ProductModal />
+
+      {authDialogOpen && (
+        <div className="modal-backdrop auth-backdrop" onClick={() => setAuthDialogOpen(false)}>
+          <section
+            className="auth-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="auth-dialog-title"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <button className="modal-close" onClick={() => setAuthDialogOpen(false)} aria-label="Close sign-in dialog">
+              <CloseIcon />
+            </button>
+            <p className="eyebrow">WELCOME TO NOIR_SCENTS</p>
+            <h2 id="auth-dialog-title">Sign in to your account</h2>
+            <p className="auth-dialog-copy">Use your Google account to sign in and speed up checkout.</p>
+            {GOOGLE_CLIENT_ID ? (
+              <div id="google-signin-button" className="google-signin-button" />
+            ) : (
+              <p className="auth-error">Google sign-in needs a client ID. Set VITE_GOOGLE_CLIENT_ID in frontend/.env.</p>
+            )}
+            {authLoading && <p className="auth-dialog-copy" role="status">Signing you in…</p>}
+            {authError && <p className="auth-error" role="alert">{authError}</p>}
+          </section>
+        </div>
+      )}
     </div>
   );
 }

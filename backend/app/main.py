@@ -1,10 +1,15 @@
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, EmailStr
 from decimal import Decimal
 from uuid import uuid4
 import os
+import requests
+from datetime import datetime, timedelta, timezone
+from google.auth.transport import requests as google_requests
+from google.oauth2 import id_token
+from jose import JWTError, jwt
 
 from .database import engine, Base, get_db
 from . import models
@@ -69,6 +74,10 @@ class CreateOrderRequest(BaseModel):
     items: list[OrderItemRequest]
 
 
+class GoogleAuthRequest(BaseModel):
+    credential: str
+
+
 # =========================================================
 # ROOT / HEALTH CHECK
 # =========================================================
@@ -79,6 +88,141 @@ def root():
         "message": "Noir_scents API is running",
         "status": "ok",
     }
+
+
+# =========================================================
+# GOOGLE SIGN-IN
+# =========================================================
+
+def create_session_token(user: models.User) -> str:
+    secret = os.getenv("AUTH_SECRET_KEY", "").strip()
+    if not secret:
+        raise HTTPException(status_code=503, detail="Authentication is not configured on the server.")
+
+    now = datetime.now(timezone.utc)
+    return jwt.encode(
+        {"sub": str(user.id), "iat": now, "exp": now + timedelta(days=7)},
+        secret,
+        algorithm="HS256",
+    )
+
+
+def get_session_user(authorization: str | None, db: Session) -> models.User:
+    secret = os.getenv("AUTH_SECRET_KEY", "").strip()
+    if not secret or not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Sign in to continue.")
+    try:
+        claims = jwt.decode(authorization[7:], secret, algorithms=["HS256"])
+        user_id = int(claims["sub"])
+    except (JWTError, KeyError, TypeError, ValueError):
+        raise HTTPException(status_code=401, detail="Your session is invalid or expired.")
+
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="Account not found.")
+    return user
+
+
+@app.post("/api/auth/google")
+def google_sign_in(request: GoogleAuthRequest, db: Session = Depends(get_db)):
+    client_id = os.getenv("GOOGLE_CLIENT_ID", "").strip()
+    if not client_id or not os.getenv("AUTH_SECRET_KEY", "").strip():
+        raise HTTPException(status_code=503, detail="Google sign-in is not configured on the server.")
+
+    try:
+        claims = id_token.verify_oauth2_token(
+            request.credential, google_requests.Request(), client_id
+        )
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Google could not verify this sign-in. Please try again.")
+
+    if claims.get("iss") not in {"accounts.google.com", "https://accounts.google.com"}:
+        raise HTTPException(status_code=401, detail="Invalid Google account issuer.")
+    if claims.get("email_verified") is not True or not claims.get("sub") or not claims.get("email"):
+        raise HTTPException(status_code=401, detail="Use a Google account with a verified email address.")
+
+    user = db.query(models.User).filter(models.User.google_sub == claims["sub"]).first()
+    if user is None:
+        user = models.User(
+            google_sub=claims["sub"],
+            email=claims["email"].lower(),
+            name=claims.get("name") or claims["email"].split("@")[0],
+            picture=claims.get("picture"),
+        )
+        db.add(user)
+        try:
+            db.commit()
+        except Exception:
+            db.rollback()
+            user = db.query(models.User).filter(models.User.google_sub == claims["sub"]).first()
+            if user is None:
+                raise HTTPException(status_code=409, detail="Unable to create your account. Please try again.")
+        else:
+            db.refresh(user)
+
+    return {
+        "access_token": create_session_token(user),
+        "token_type": "bearer",
+        "user": {"id": user.id, "email": user.email, "name": user.name, "picture": user.picture},
+    }
+
+
+@app.get("/api/auth/me")
+def get_current_user(authorization: str | None = Header(default=None), db: Session = Depends(get_db)):
+    user = get_session_user(authorization, db)
+    return {"id": user.id, "email": user.email, "name": user.name, "picture": user.picture}
+
+
+def send_order_confirmation_email(order: models.Order, items: list[dict]) -> bool:
+    api_key = os.getenv("MAILGUN_API_KEY", "").strip()
+    domain = os.getenv("MAILGUN_DOMAIN", "").strip()
+    sender = os.getenv("MAILGUN_FROM", "").strip()
+    if not api_key or not domain or not sender:
+        print("Mailgun is not configured; order confirmation email skipped.")
+        return False
+
+    base_url = os.getenv("MAILGUN_BASE_URL", "https://api.mailgun.net").strip().rstrip("/")
+    item_lines = [
+        f"- {item['product'].name} x{item['quantity']} — NGN {item['line_total']:,.2f}"
+        for item in items
+    ]
+    body = "\n".join([
+        f"Hello {order.customer_name},",
+        "",
+        "Thank you for your order. We have received it and its payment is currently pending.",
+        "We will update you when your payment is confirmed.",
+        "",
+        f"Order number: {order.order_number}",
+        f"Payment method: {order.payment_method}",
+        "",
+        "Items:",
+        *item_lines,
+        "",
+        f"Subtotal: NGN {order.subtotal:,.2f}",
+        f"Delivery: NGN {order.delivery_fee:,.2f}",
+        f"Total: NGN {order.total:,.2f}",
+        "",
+        "Noir Scents",
+    ])
+
+    try:
+        response = requests.post(
+            f"{base_url}/v3/{domain}/messages",
+            auth=("api", api_key),
+            data={
+                "from": sender,
+                "to": order.customer_email,
+                "subject": f"Order confirmation: {order.order_number}",
+                "text": body,
+            },
+            timeout=10,
+        )
+        response.raise_for_status()
+        return True
+    except requests.RequestException as error:
+        status_code = getattr(getattr(error, "response", None), "status_code", None)
+        print(f"Mailgun order confirmation failed (HTTP {status_code or 'request error'}).")
+        return False
 
 
 # =========================================================
@@ -292,6 +436,8 @@ def create_order(
         db.commit()
         db.refresh(order)
 
+        confirmation_email_sent = send_order_confirmation_email(order, order_items)
+
         return {
             "success": True,
             "message": "Order created successfully.",
@@ -304,6 +450,7 @@ def create_order(
             "payment_method": order.payment_method,
             "payment_status": order.payment_status,
             "order_status": order.order_status,
+            "confirmation_email_sent": confirmation_email_sent,
         }
 
     except HTTPException:
