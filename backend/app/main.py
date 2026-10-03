@@ -7,9 +7,11 @@ from uuid import uuid4
 import os
 import requests
 from datetime import datetime, timedelta, timezone
+from google.auth.exceptions import TransportError
 from google.auth.transport import requests as google_requests
 from google.oauth2 import id_token
 from jose import JWTError, jwt
+from sqlalchemy import update
 
 from .database import engine, Base, get_db
 from . import models
@@ -33,6 +35,7 @@ app.add_middleware(
         "http://127.0.0.1:5173",
         "http://localhost:5174",
         "http://127.0.0.1:5174",
+        "https://noir-scents-chi.vercel.app",
         *[
             origin.strip().rstrip("/")
             for origin in os.getenv("FRONTEND_URL", "").split(",")
@@ -128,6 +131,48 @@ def get_session_user(authorization: str | None, db: Session) -> models.User:
     return user
 
 
+def send_welcome_email(user: models.User) -> bool:
+    api_key = os.getenv("MAILGUN_API_KEY", "").strip()
+    domain = os.getenv("MAILGUN_DOMAIN", "").strip()
+    sender = os.getenv("MAILGUN_FROM", "").strip()
+    if not api_key or not domain or not sender:
+        print("Mailgun is not configured; welcome email skipped.")
+        return False
+
+    base_url = os.getenv("MAILGUN_BASE_URL", "https://api.mailgun.net").strip().rstrip("/")
+    name = user.name or "there"
+    body = "\n".join([
+        f"Hello {name},",
+        "",
+        "Welcome to Noir Scents!",
+        "Your account has been created successfully. You can now sign in with Google",
+        "to make checkout easier.",
+        "",
+        "Thank you for joining us.",
+        "",
+        "Noir Scents",
+    ])
+
+    try:
+        response = requests.post(
+            f"{base_url}/v3/{domain}/messages",
+            auth=("api", api_key),
+            data={
+                "from": sender,
+                "to": user.email,
+                "subject": "Welcome to Noir Scents",
+                "text": body,
+            },
+            timeout=10,
+        )
+        response.raise_for_status()
+        return True
+    except requests.RequestException as error:
+        status_code = getattr(getattr(error, "response", None), "status_code", None)
+        print(f"Mailgun welcome email failed (HTTP {status_code or 'request error'}).")
+        return False
+
+
 @app.post("/api/auth/google")
 def google_sign_in(request: GoogleAuthRequest, db: Session = Depends(get_db)):
     client_id = os.getenv("GOOGLE_CLIENT_ID", "").strip()
@@ -140,6 +185,8 @@ def google_sign_in(request: GoogleAuthRequest, db: Session = Depends(get_db)):
         )
     except ValueError:
         raise HTTPException(status_code=401, detail="Google could not verify this sign-in. Please try again.")
+    except TransportError:
+        raise HTTPException(status_code=503, detail="Google sign-in is temporarily unavailable. Please try again.")
 
     if claims.get("iss") not in {"accounts.google.com", "https://accounts.google.com"}:
         raise HTTPException(status_code=401, detail="Invalid Google account issuer.")
@@ -147,6 +194,7 @@ def google_sign_in(request: GoogleAuthRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=401, detail="Use a Google account with a verified email address.")
 
     user = db.query(models.User).filter(models.User.google_sub == claims["sub"]).first()
+    welcome_email_sent = False
     if user is None:
         user = models.User(
             google_sub=claims["sub"],
@@ -164,11 +212,13 @@ def google_sign_in(request: GoogleAuthRequest, db: Session = Depends(get_db)):
                 raise HTTPException(status_code=409, detail="Unable to create your account. Please try again.")
         else:
             db.refresh(user)
+            welcome_email_sent = send_welcome_email(user)
 
     return {
         "access_token": create_session_token(user),
         "token_type": "bearer",
         "user": {"id": user.id, "email": user.email, "name": user.name, "picture": user.picture},
+        "welcome_email_sent": welcome_email_sent,
     }
 
 
@@ -299,6 +349,7 @@ def create_order(
 
     subtotal = Decimal("0.00")
     order_items = []
+    requested_quantities = {}
 
     try:
 
@@ -314,10 +365,17 @@ def create_order(
                     detail="Quantity must be greater than zero.",
                 )
 
+            requested_quantities[requested_item.product_id] = (
+                requested_quantities.get(requested_item.product_id, 0)
+                + requested_item.quantity
+            )
+
+        for product_id in sorted(requested_quantities):
+            quantity = requested_quantities[product_id]
             product = (
                 db.query(models.Product)
                 .filter(
-                    models.Product.id == requested_item.product_id,
+                    models.Product.id == product_id,
                     models.Product.active == True,
                 )
                 .first()
@@ -327,7 +385,7 @@ def create_order(
                 raise HTTPException(
                     status_code=404,
                     detail=(
-                        f"Product {requested_item.product_id} "
+                        f"Product {product_id} "
                         "was not found."
                     ),
                 )
@@ -336,7 +394,7 @@ def create_order(
             # Check stock
             # ---------------------------------------------
 
-            if product.stock < requested_item.quantity:
+            if product.stock < quantity:
                 raise HTTPException(
                     status_code=400,
                     detail=(
@@ -350,7 +408,7 @@ def create_order(
             # ---------------------------------------------
 
             line_total = (
-                product.price * requested_item.quantity
+                product.price * quantity
             )
 
             subtotal += line_total
@@ -358,7 +416,7 @@ def create_order(
             order_items.append(
                 {
                     "product": product,
-                    "quantity": requested_item.quantity,
+                    "quantity": quantity,
                     "line_total": line_total,
                 }
             )
@@ -420,6 +478,25 @@ def create_order(
             quantity = item["quantity"]
             line_total = item["line_total"]
 
+            stock_update = db.execute(
+                update(models.Product)
+                .where(
+                    models.Product.id == product.id,
+                    models.Product.active == True,
+                    models.Product.stock >= quantity,
+                )
+                .values(stock=models.Product.stock - quantity)
+                .execution_options(synchronize_session=False)
+            )
+            if stock_update.rowcount != 1:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Stock for {product.name} changed while completing "
+                        "your order. Please refresh your cart and try again."
+                    ),
+                )
+
             order_item = models.OrderItem(
                 order_id=order.id,
                 product_id=product.id,
@@ -430,9 +507,6 @@ def create_order(
             )
 
             db.add(order_item)
-
-            # Reduce inventory
-            product.stock -= quantity
 
         # -------------------------------------------------
         # Save everything
