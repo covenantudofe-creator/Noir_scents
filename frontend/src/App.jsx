@@ -1,4 +1,5 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { NIGERIAN_LOCATIONS, NIGERIAN_STATES } from "./data/nigeriaLocations.js";
 
 const API_URL = (
   import.meta.env.VITE_API_URL ||
@@ -41,6 +42,7 @@ const LOCAL_IMAGES = {
     "/perfumes/club-de-nuit-intense-man.jpg",
     "Club de Nuit Woman":
     "/perfumes/club-de-nuit-intense-woman.jpg",
+  "Iconic": "/perfumes/Iconic.jpg",
   "Sheikh Al Shuyukh":
     "/perfumes/sheikh-al-shuyukh.jpg",
   "Oud Mood Elixir":
@@ -55,8 +57,6 @@ const LOCAL_IMAGES = {
     "/perfumes/raghba.jpg",
   "Musk Tahara":
     "/perfumes/musk-tahara.jpg",
-    "Miss Kiki":
-    "/perfumes/miss-kiki.jpg",
   "Sure Roll-On":
     "/perfumes/sure-roll-on.jpg",
   "Dove Roll-On":
@@ -99,6 +99,9 @@ const LOCAL_IMAGES = {
   "Shaghaf Oud Aswad": "/perfumes/shaghaf-oud-aswad.jpg",
   "Tres Nuit": "/perfumes/tres-nuit.jpg",
   "Yara Moi": "/perfumes/yara-moi.jpg",
+  "Khamrah": "/perfumes/khamrah.jpg.jpg",
+  "Pure Seduction": "/perfumes/pure-seduction.jpg",
+  "Shaghaf Oud": "/perfumes/shaghaf-oud.jpg",
 
 
 };
@@ -146,6 +149,18 @@ function getProductImage(product) {
   }
 
   return FALLBACK_IMAGE;
+}
+
+function handleProductImageError(event, product) {
+  const image = event.currentTarget;
+  const databaseUrl = product?.image_url?.trim();
+  if (image.dataset.triedDatabase !== "true" && databaseUrl && image.getAttribute("src") !== databaseUrl) {
+    image.dataset.triedDatabase = "true";
+    image.src = databaseUrl;
+    return;
+  }
+  image.onerror = null;
+  image.src = FALLBACK_IMAGE;
 }
 
 /*
@@ -320,10 +335,7 @@ function ProductCard({
           src={image}
           alt={product.name}
           className="product-image"
-          onError={(event) => {
-            event.currentTarget.onerror = null;
-            event.currentTarget.src = FALLBACK_IMAGE;
-          }}
+          onError={(event) => handleProductImageError(event, product)}
         />
 
         <div className="product-overlay">
@@ -449,7 +461,13 @@ export default function App() {
   const [productsError, setProductsError] =
     useState("");
 
-  const [cart, setCart] = useState([]);
+  const [cart, setCart] = useState(() => {
+    try {
+      return JSON.parse(sessionStorage.getItem("noir_pending_cart") || "[]");
+    } catch {
+      return [];
+    }
+  });
 
   const [mobileMenu, setMobileMenu] =
     useState(false);
@@ -464,12 +482,17 @@ export default function App() {
     useState(false);
   const [orderNumber, setOrderNumber] =
     useState("");
+  const [orderPaymentStatus, setOrderPaymentStatus] = useState("PENDING");
   const [orderSubmitting, setOrderSubmitting] = useState(false);
+  const [paymentVerifying, setPaymentVerifying] = useState(false);
   const [orderError, setOrderError] = useState("");
   const [authDialogOpen, setAuthDialogOpen] = useState(false);
   const [authUser, setAuthUser] = useState(null);
   const [authError, setAuthError] = useState("");
   const [authLoading, setAuthLoading] = useState(false);
+  const authRequestInProgress = useRef(false);
+  const googleInitialized = useRef(false);
+  const paymentCallbackInProgress = useRef(false);
 
   const [paymentMethod, setPaymentMethod] =
     useState("paystack");
@@ -483,6 +506,47 @@ export default function App() {
       city: "",
       state: "",
     });
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const reference = params.get("reference") || params.get("trxref");
+    if (!reference || paymentCallbackInProgress.current) return;
+    if (!API_URL) {
+      setOrderError("The backend URL is not configured, so this payment cannot be verified.");
+      setPage("checkout");
+      return;
+    }
+
+    paymentCallbackInProgress.current = true;
+    setPaymentVerifying(true);
+    setOrderError("");
+    fetch(`${API_URL}/api/payments/paystack/verify?reference=${encodeURIComponent(reference)}`)
+      .then(readApiResponse)
+      .then((result) => {
+        setOrderPaymentStatus(result.payment_status || "PENDING");
+        setOrderNumber(result.order_number || "");
+        if (result.payment_status === "PAID") {
+          setCart([]);
+          sessionStorage.removeItem("noir_pending_cart");
+          setOrderSubmitted(true);
+          setPage("checkout");
+        } else if (result.payment_status === "FAILED" || result.payment_status === "CANCELLED") {
+          setOrderError("Payment was not completed. No payment was confirmed. You can try checkout again.");
+          setPage("checkout");
+        } else {
+          setOrderError("Payment is still being confirmed. Please wait a moment and try again.");
+          setPage("checkout");
+        }
+      })
+      .catch((error) => {
+        setOrderError(error.message || "We could not verify this payment. Please contact us before trying again.");
+        setPage("checkout");
+      })
+      .finally(() => {
+        setPaymentVerifying(false);
+        window.history.replaceState({}, "", `${window.location.pathname}${window.location.hash}`);
+      });
+  }, []);
 
   useEffect(() => {
     const token = sessionStorage.getItem("noir_session");
@@ -508,44 +572,78 @@ export default function App() {
   useEffect(() => {
     if (!authDialogOpen || !GOOGLE_CLIENT_ID) return;
 
+    let active = true;
     const initializeGoogleButton = () => {
+      if (!active) return;
       const buttonContainer = document.getElementById("google-signin-button");
-      if (!buttonContainer || !window.google?.accounts?.id) return;
-      window.google.accounts.id.initialize({
-        client_id: GOOGLE_CLIENT_ID,
-        callback: async ({ credential }) => {
-          setAuthLoading(true);
-          setAuthError("");
-          try {
-            const response = await fetch(`${API_URL}/api/auth/google`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ credential }),
-            });
-            const result = await readApiResponse(response);
-            sessionStorage.setItem("noir_session", result.access_token);
-            setAuthUser(result.user);
-            setCheckoutForm((current) => ({
-              ...current,
-              customer_name: current.customer_name || result.user.name || "",
-              customer_email: current.customer_email || result.user.email || "",
-            }));
-            setAuthDialogOpen(false);
-          } catch (error) {
-            setAuthError(error.message || "Google sign-in failed. Please try again.");
-          } finally {
-            setAuthLoading(false);
-          }
-        },
-      });
-      buttonContainer.replaceChildren();
-      window.google.accounts.id.renderButton(buttonContainer, {
-        theme: "outline",
-        size: "large",
-        text: "continue_with",
-        shape: "rectangular",
-        width: 280,
-      });
+      if (!buttonContainer) return;
+      if (!window.google?.accounts?.id) {
+        setAuthError("Google sign-in loaded incorrectly. Refresh the page and try again.");
+        return;
+      }
+      try {
+        if (!googleInitialized.current) {
+          window.google.accounts.id.initialize({
+            client_id: GOOGLE_CLIENT_ID,
+            callback: async ({ credential } = {}) => {
+              if (!credential || authRequestInProgress.current) {
+                if (!credential) {
+                  setAuthError("Google did not return a sign-in credential. Please try again.");
+                }
+                return;
+              }
+              authRequestInProgress.current = true;
+              setAuthLoading(true);
+              setAuthError("");
+              try {
+                if (!API_URL) {
+                  throw new Error("The backend URL is not configured. Set VITE_API_URL and rebuild the frontend.");
+                }
+                const response = await fetch(`${API_URL}/api/auth/google`, {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ credential }),
+                });
+                const result = await readApiResponse(response);
+                if (!result.access_token || !result.user) {
+                  throw new Error("The server returned an invalid sign-in response.");
+                }
+                sessionStorage.setItem("noir_session", result.access_token);
+                setAuthUser(result.user);
+                setCheckoutForm((current) => ({
+                  ...current,
+                  customer_name: current.customer_name || result.user.name || "",
+                  customer_email: current.customer_email || result.user.email || "",
+                }));
+                setAuthDialogOpen(false);
+              } catch (error) {
+                setAuthError(error.message || "Google sign-in failed. Please try again.");
+              } finally {
+                authRequestInProgress.current = false;
+                setAuthLoading(false);
+              }
+            },
+          });
+          googleInitialized.current = true;
+        }
+        buttonContainer.replaceChildren();
+        window.google.accounts.id.renderButton(buttonContainer, {
+          theme: "outline",
+          size: "large",
+          text: "continue_with",
+          shape: "rectangular",
+          width: Math.min(280, buttonContainer.clientWidth || 280),
+        });
+      } catch {
+        setAuthError("Google sign-in could not start. Check the configured Google client ID and authorized website origins.");
+      }
+    };
+
+    const handleScriptError = () => {
+      if (active) {
+        script.dataset.loadFailed = "true";
+        setAuthError("Google sign-in could not load. Check your connection or browser privacy settings, then try again.");
+      }
     };
 
     let script = document.getElementById("google-identity-services");
@@ -558,10 +656,21 @@ export default function App() {
         script.src = "https://accounts.google.com/gsi/client";
         script.async = true;
         script.defer = true;
-        document.head.appendChild(script);
       }
-      script.addEventListener("load", initializeGoogleButton, { once: true });
+      if (script.dataset.loadFailed === "true") {
+        handleScriptError();
+      } else {
+        script.addEventListener("load", initializeGoogleButton, { once: true });
+        script.addEventListener("error", handleScriptError, { once: true });
+        if (!script.isConnected) document.head.appendChild(script);
+      }
     }
+
+    return () => {
+      active = false;
+      script?.removeEventListener("load", initializeGoogleButton);
+      script?.removeEventListener("error", handleScriptError);
+    };
   }, [authDialogOpen]);
 
   function signOut() {
@@ -581,6 +690,9 @@ export default function App() {
         setProductsLoading(true);
         setProductsError("");
 
+        if (!API_URL) {
+          throw new Error("The backend URL is not configured. Set VITE_API_URL and rebuild the frontend.");
+        }
         const response = await fetch(`${API_URL}/api/products`);
         const data = await readApiResponse(response);
 
@@ -816,6 +928,7 @@ export default function App() {
     setCheckoutForm((current) => ({
       ...current,
       [name]: value,
+      ...(name === "state" ? { city: "" } : {}),
     }));
   }
 
@@ -829,6 +942,9 @@ export default function App() {
     setOrderSubmitting(true);
     setOrderError("");
     try {
+      if (!API_URL) {
+        throw new Error("The backend URL is not configured. Set VITE_API_URL and rebuild the frontend.");
+      }
       const response = await fetch(
         `${API_URL}/api/orders`,
         {
@@ -849,9 +965,23 @@ export default function App() {
 
       const data = await readApiResponse(response);
 
+      if (paymentMethod === "paystack") {
+        if (!data.authorization_url || !data.reference) {
+          throw new Error("The server did not return a Paystack payment link. Your order was not sent for payment.");
+        }
+        try {
+          sessionStorage.setItem("noir_pending_cart", JSON.stringify(cart));
+        } catch (storageError) {
+          console.warn("Could not save the cart for a cancelled payment return.", storageError);
+        }
+        window.location.assign(data.authorization_url);
+        return;
+      }
+
       setOrderNumber(
         data.order_number || ""
       );
+      setOrderPaymentStatus(data.payment_status || "PENDING");
 
       setOrderSubmitted(true);
       setCart([]);
@@ -944,12 +1074,8 @@ export default function App() {
               }
               alt="Luxury perfume"
               className="hero-image"
-              onError={(event) => {
-                event.currentTarget.onerror =
-                  null;
-                event.currentTarget.src =
-                  FALLBACK_IMAGE;
-              }}
+              onError={(event) => handleProductImageError(event, heroProduct)}
+              onError={(event) => handleProductImageError(event, heroProduct)}
             />
           </div>
         </section>
@@ -1211,14 +1337,7 @@ export default function App() {
                       alt={
                         collection.title
                       }
-                      onError={(
-                        event
-                      ) => {
-                        event.currentTarget.onerror =
-                          null;
-                        event.currentTarget.src =
-                          FALLBACK_IMAGE;
-                      }}
+                      onError={(event) => handleProductImageError(event, collectionProducts[0])}
                     />
                   </div>
 
@@ -1296,12 +1415,7 @@ export default function App() {
                   : FALLBACK_IMAGE
               }
               alt="Noir_scents fragrance"
-              onError={(event) => {
-                event.currentTarget.onerror =
-                  null;
-                event.currentTarget.src =
-                  FALLBACK_IMAGE;
-              }}
+              onError={(event) => handleProductImageError(event, aboutProduct)}
             />
           </div>
 
@@ -1505,12 +1619,7 @@ export default function App() {
                     item
                   )}
                   alt={item.name}
-                  onError={(event) => {
-                    event.currentTarget.onerror =
-                      null;
-                    event.currentTarget.src =
-                      FALLBACK_IMAGE;
-                  }}
+                  onError={(event) => handleProductImageError(event, item)}
                 />
 
                 <div className="cart-item-info">
@@ -1617,7 +1726,7 @@ export default function App() {
               <span>Delivery</span>
 
               <span>
-                Calculated at checkout
+                Free
               </span>
             </div>
 
@@ -1653,6 +1762,7 @@ export default function App() {
   */
 
   function CheckoutPage() {
+    const availableCities = NIGERIAN_LOCATIONS[checkoutForm.state] || [];
     if (orderSubmitted) {
       return (
         <section className="page-section">
@@ -1670,7 +1780,9 @@ export default function App() {
             </h1>
 
             <p>
-              Your order was saved with pending payment status. Payment has not been confirmed yet.
+              {orderPaymentStatus === "PAID"
+                ? "Your payment is confirmed and your order is being prepared."
+                : "Your order was saved with pending payment status. Payment has not been confirmed yet."}
             </p>
 
             {orderNumber && (
@@ -1809,8 +1921,7 @@ export default function App() {
                 <label>
                   City
 
-                  <input
-                    type="text"
+                  <select
                     name="city"
                     value={
                       checkoutForm.city
@@ -1818,15 +1929,22 @@ export default function App() {
                     onChange={
                       handleCheckoutChange
                     }
-                    placeholder="City"
-                  />
+                    required
+                    disabled={!checkoutForm.state}
+                  >
+                    <option value="">
+                      {checkoutForm.state ? "Select a city" : "Select a state first"}
+                    </option>
+                    {availableCities.map((city) => (
+                      <option key={city} value={city}>{city}</option>
+                    ))}
+                  </select>
                 </label>
 
                 <label>
                   State
 
-                  <input
-                    type="text"
+                  <select
                     name="state"
                     value={
                       checkoutForm.state
@@ -1834,8 +1952,13 @@ export default function App() {
                     onChange={
                       handleCheckoutChange
                     }
-                    placeholder="State"
-                  />
+                    required
+                  >
+                    <option value="">Select a state</option>
+                    {NIGERIAN_STATES.map((state) => (
+                      <option key={state} value={state}>{state}</option>
+                    ))}
+                  </select>
                 </label>
 
                 <label className="full-field">
@@ -1865,6 +1988,12 @@ export default function App() {
               <h2>
                 Choose Payment Method
               </h2>
+
+              <p role="status">
+                {paymentVerifying
+                  ? "Confirming your Paystack payment..."
+                  : "Pay securely with Paystack. Your order is marked paid only after the server verifies your transaction."}
+              </p>
 
               <div className="payment-options">
                 <label
@@ -1897,9 +2026,7 @@ export default function App() {
                     </strong>
 
                     <span>
-                      Card, transfer and
-                      other supported
-                      methods
+                      Pay securely by card or bank transfer
                     </span>
                   </div>
                 </label>
@@ -1934,8 +2061,7 @@ export default function App() {
                     </strong>
 
                     <span>
-                      Secure online
-                      payment
+                      Payment processing is not enabled yet
                     </span>
                   </div>
                 </label>
@@ -1970,7 +2096,7 @@ export default function App() {
                     </strong>
 
                     <span>
-                      Pay using OPay
+                      Payment processing is not enabled yet
                     </span>
                   </div>
                 </label>
@@ -2005,8 +2131,7 @@ export default function App() {
                     </strong>
 
                     <span>
-                      Pay directly via
-                      bank transfer
+                      Manual transfer details are not configured
                     </span>
                   </div>
                 </label>
@@ -2018,7 +2143,7 @@ export default function App() {
               className="primary-button full-width checkout-submit"
               disabled={orderSubmitting}
             >
-              {orderSubmitting ? "Submitting order..." : "Place Order"}
+              {orderSubmitting ? "Starting checkout..." : paymentMethod === "paystack" ? "Pay Now" : "Place Order"}
               <ArrowIcon />
             </button>
             {orderError && (
@@ -2044,12 +2169,7 @@ export default function App() {
                       item
                     )}
                     alt={item.name}
-                    onError={(event) => {
-                      event.currentTarget.onerror =
-                        null;
-                      event.currentTarget.src =
-                        FALLBACK_IMAGE;
-                    }}
+                    onError={(event) => handleProductImageError(event, item)}
                   />
 
                   <div>
@@ -2091,7 +2211,7 @@ export default function App() {
               <span>Delivery</span>
 
               <span>
-                Calculated later
+                Free
               </span>
             </div>
 
@@ -2159,12 +2279,7 @@ export default function App() {
               alt={
                 selectedProduct.name
               }
-              onError={(event) => {
-                event.currentTarget.onerror =
-                  null;
-                event.currentTarget.src =
-                  FALLBACK_IMAGE;
-              }}
+              onError={(event) => handleProductImageError(event, selectedProduct)}
             />
           </div>
 
@@ -2378,7 +2493,9 @@ export default function App() {
                 !mobileMenu
               )
             }
-            aria-label="Menu"
+            aria-label={mobileMenu ? "Close menu" : "Open menu"}
+            aria-expanded={mobileMenu}
+            aria-controls="mobile-navigation"
           >
             {mobileMenu ? (
               <CloseIcon />
@@ -2397,6 +2514,7 @@ export default function App() {
           </button>
 
           <nav
+            id="mobile-navigation"
             className={`main-nav ${
               mobileMenu
                 ? "mobile-open"
@@ -2472,7 +2590,9 @@ export default function App() {
           <div className="header-actions">
             {authUser ? (
               <button className="account-button" onClick={signOut} title={`Signed in as ${authUser.email}`}>
-                {authUser.name?.split(" ")[0] || "Account"} · Sign out
+                <span className="account-name">{authUser.name?.split(" ")[0] || "Account"}</span>
+                <span className="account-separator"> · </span>
+                <span>Sign out</span>
               </button>
             ) : (
               <button className="account-button" onClick={() => { setAuthError(""); setAuthDialogOpen(true); }}>
@@ -2574,9 +2694,7 @@ export default function App() {
           <CartPage />
         )}
 
-        {page === "checkout" && (
-          <CheckoutPage />
-        )}
+        {page === "checkout" && CheckoutPage()}
       </main>
 
       <Footer />

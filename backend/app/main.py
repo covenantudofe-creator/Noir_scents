@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Depends, HTTPException, Header
+from fastapi import Request
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, EmailStr
@@ -12,6 +13,9 @@ from google.auth.transport import requests as google_requests
 from google.oauth2 import id_token
 from jose import JWTError, jwt
 from sqlalchemy import update
+import hashlib
+import hmac
+import json
 
 from .database import engine, Base, get_db
 from . import models
@@ -244,8 +248,7 @@ def send_order_confirmation_email(order: models.Order, items: list[dict]) -> boo
     body = "\n".join([
         f"Hello {order.customer_name},",
         "",
-        "Thank you for your order. We have received it and its payment is currently pending.",
-        "We will update you when your payment is confirmed.",
+        "Thank you for your order. Your payment has been confirmed successfully.",
         "",
         f"Order number: {order.order_number}",
         f"Payment method: {order.payment_method}",
@@ -278,6 +281,156 @@ def send_order_confirmation_email(order: models.Order, items: list[dict]) -> boo
         status_code = getattr(getattr(error, "response", None), "status_code", None)
         print(f"Mailgun order confirmation failed (HTTP {status_code or 'request error'}).")
         return False
+
+
+def paystack_headers() -> dict[str, str]:
+    secret_key = os.getenv("PAYSTACK_SECRET_KEY", "").strip()
+    if not secret_key:
+        raise HTTPException(
+            status_code=503,
+            detail="Online payment is not configured on the server.",
+        )
+    return {"Authorization": f"Bearer {secret_key}", "Content-Type": "application/json"}
+
+
+def initialize_paystack(order: models.Order) -> dict:
+    frontend_url = os.getenv("PAYSTACK_CALLBACK_URL", "").strip()
+    if not frontend_url:
+        frontend_url = next(
+            (origin.strip().rstrip("/") for origin in os.getenv("FRONTEND_URL", "").split(",") if origin.strip()),
+            "",
+        )
+    if not frontend_url:
+        raise HTTPException(status_code=503, detail="The payment return URL is not configured.")
+
+    reference = f"NS-{uuid4().hex}"
+    amount_kobo = int((order.total * 100).to_integral_exact())
+    try:
+        response = requests.post(
+            "https://api.paystack.co/transaction/initialize",
+            headers=paystack_headers(),
+            json={
+                "email": order.customer_email,
+                "amount": amount_kobo,
+                "currency": "NGN",
+                "reference": reference,
+                "callback_url": frontend_url,
+                "metadata": {"order_id": order.id, "order_number": order.order_number},
+            },
+            timeout=20,
+        )
+        response.raise_for_status()
+        result = response.json()
+    except HTTPException:
+        raise
+    except (requests.RequestException, ValueError) as error:
+        print(f"Paystack initialization failed: {error}")
+        raise HTTPException(status_code=502, detail="Unable to start payment. Please try again.")
+
+    details = result.get("data") or {}
+    if not result.get("status") or not details.get("authorization_url"):
+        raise HTTPException(status_code=502, detail="Paystack could not start this payment.")
+    if details.get("reference") != reference:
+        raise HTTPException(status_code=502, detail="Paystack returned an invalid payment reference.")
+    order.payment_reference = reference
+    return {"authorization_url": details["authorization_url"], "reference": reference}
+
+
+def finish_paystack_payment(reference: str, db: Session) -> dict:
+    order = db.query(models.Order).filter(models.Order.payment_reference == reference).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Payment reference was not found.")
+
+    if order.payment_status == "PAID":
+        return {"success": True, "payment_status": "PAID", "order_number": order.order_number}
+    if order.payment_status != "PENDING":
+        return {"success": False, "payment_status": order.payment_status, "order_number": order.order_number}
+
+    try:
+        response = requests.get(
+            f"https://api.paystack.co/transaction/verify/{reference}",
+            headers=paystack_headers(),
+            timeout=20,
+        )
+        response.raise_for_status()
+        result = response.json()
+    except HTTPException:
+        raise
+    except (requests.RequestException, ValueError) as error:
+        print(f"Paystack verification failed: {error}")
+        raise HTTPException(status_code=502, detail="Unable to verify payment right now. Please try again.")
+
+    transaction = result.get("data") or {}
+    if not result.get("status") or transaction.get("reference") != reference:
+        raise HTTPException(status_code=502, detail="Paystack returned an invalid verification response.")
+
+    if transaction.get("status") == "success":
+        expected_kobo = int((order.total * 100).to_integral_exact())
+        if transaction.get("amount") != expected_kobo or transaction.get("currency") != "NGN":
+            raise HTTPException(status_code=409, detail="Verified payment amount does not match this order.")
+        changed = db.query(models.Order).filter(
+            models.Order.id == order.id,
+            models.Order.payment_status == "PENDING",
+        ).update(
+            {models.Order.payment_status: "PAID", models.Order.order_status: "CONFIRMED"},
+            synchronize_session=False,
+        )
+        db.commit()
+        db.refresh(order)
+        if changed:
+            email_items = [
+                {"product": item.product, "quantity": item.quantity, "line_total": item.line_total}
+                for item in order.items
+            ]
+            send_order_confirmation_email(order, email_items)
+        return {"success": True, "payment_status": order.payment_status, "order_number": order.order_number}
+
+    if transaction.get("status") in {"failed", "abandoned"}:
+        changed = db.query(models.Order).filter(
+            models.Order.id == order.id,
+            models.Order.payment_status == "PENDING",
+        ).update(
+            {models.Order.payment_status: "FAILED", models.Order.order_status: "CANCELLED"},
+            synchronize_session=False,
+        )
+        if changed:
+            for item in order.items:
+                db.execute(
+                    update(models.Product)
+                    .where(models.Product.id == item.product_id)
+                    .values(stock=models.Product.stock + item.quantity)
+                )
+        db.commit()
+        db.refresh(order)
+        return {"success": False, "payment_status": order.payment_status, "order_number": order.order_number}
+
+    return {"success": False, "payment_status": "PENDING", "order_number": order.order_number}
+
+
+@app.get("/api/payments/paystack/verify")
+def verify_paystack_payment(reference: str, db: Session = Depends(get_db)):
+    return finish_paystack_payment(reference, db)
+
+
+@app.post("/api/payments/paystack/webhook")
+async def paystack_webhook(request: Request, db: Session = Depends(get_db)):
+    secret_key = os.getenv("PAYSTACK_SECRET_KEY", "").strip()
+    if not secret_key:
+        raise HTTPException(status_code=503, detail="Online payment is not configured on the server.")
+    body = await request.body()
+    signature = request.headers.get("x-paystack-signature", "")
+    expected = hmac.new(secret_key.encode(), body, hashlib.sha512).hexdigest()
+    if not hmac.compare_digest(signature, expected):
+        raise HTTPException(status_code=401, detail="Invalid webhook signature.")
+    try:
+        event = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise HTTPException(status_code=400, detail="Invalid webhook payload.")
+    if event.get("event") in {"charge.success", "charge.failed"}:
+        reference = (event.get("data") or {}).get("reference")
+        if reference:
+            finish_paystack_payment(reference, db)
+    return {"received": True}
 
 
 # =========================================================
@@ -350,6 +503,7 @@ def create_order(
     subtotal = Decimal("0.00")
     order_items = []
     requested_quantities = {}
+    paystack_payment = None
 
     try:
 
@@ -512,10 +666,11 @@ def create_order(
         # Save everything
         # -------------------------------------------------
 
+        if order.payment_method == "paystack":
+            paystack_payment = initialize_paystack(order)
+
         db.commit()
         db.refresh(order)
-
-        confirmation_email_sent = send_order_confirmation_email(order, order_items)
 
         return {
             "success": True,
@@ -529,7 +684,8 @@ def create_order(
             "payment_method": order.payment_method,
             "payment_status": order.payment_status,
             "order_status": order.order_status,
-            "confirmation_email_sent": confirmation_email_sent,
+            "authorization_url": paystack_payment["authorization_url"] if paystack_payment else None,
+            "reference": paystack_payment["reference"] if paystack_payment else None,
         }
 
     except HTTPException:
