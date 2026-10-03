@@ -1,10 +1,9 @@
-# Noir_scents — React + FastAPI + multiple Nigerian payment methods
+# Noir_scents — React + FastAPI + PostgreSQL
 
-This version supports four checkout choices:
-1. Paystack — server-side transaction initialization and verification.
-2. Flutterwave — server-side Standard checkout and verification.
-3. OPay — encrypted server-side order creation using OPay's RSA API envelope; OPay merchant-specific configuration is required.
-4. Bank transfer — manual transfer instructions using the bank details in `.env`.
+The storefront uses React/Vite and the API uses FastAPI with PostgreSQL. The
+current backend creates orders with a pending payment status. Although the
+storefront lets customers choose a payment method, the checked-in backend does
+not currently call Paystack, Flutterwave, or OPay APIs or verify payments.
 
 ## Frontend
 ```powershell
@@ -24,8 +23,60 @@ copy .env.example .env
 uvicorn app.main:app --reload
 ```
 
+## Deploy to Render
+
+This repository contains both services, so create two Render services from the
+same GitHub repository and set a different **Root Directory** for each one.
+Keep using the PostgreSQL database configured by `DATABASE_URL`; the backend
+does not use Supabase.
+
+### Frontend Static Site
+
+- **Root Directory:** `frontend`
+- **Build Command:** `npm ci && npm run build`
+- **Publish Directory:** `dist`
+- **Environment Variables:**
+  - `VITE_API_URL`: the backend Web Service URL, with no trailing slash
+  - `VITE_GOOGLE_CLIENT_ID`: the public Google OAuth client ID used locally
+
+Vite reads these variables at build time. Trigger a new deploy after changing
+either value.
+
+### Backend Web Service
+
+- **Root Directory:** `backend`
+- **Build Command:** `pip install -r requirements.txt`
+- **Start Command:** `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
+- **Environment Variables:**
+  - `DATABASE_URL`: the connection string for the existing PostgreSQL database
+  - `FRONTEND_URL`: the frontend Static Site URL, with no trailing slash
+  - `GOOGLE_CLIENT_ID`: the same public Google OAuth client ID
+  - `AUTH_SECRET_KEY`: a unique, long random signing key
+  - `MAILGUN_API_KEY`, `MAILGUN_DOMAIN`, and `MAILGUN_FROM`: required for order
+    confirmation email; `MAILGUN_BASE_URL` is optional and defaults to the US
+    API endpoint
+  - `PORT` is supplied automatically by Render; do not set a fixed production
+    port
+
+The backend binds to `0.0.0.0` through the start command. Locally, Uvicorn uses
+port `8000` by default. After deployment, check `https://<backend-url>/health`;
+it should return `{"status":"ok"}`.
+
+### Connect the deployed URLs
+
+After Render creates both services, set the backend's `FRONTEND_URL` to the
+frontend URL and the frontend's `VITE_API_URL` to the backend URL. Use the same
+frontend URL in Google Cloud Console under **Authorized JavaScript origins**.
+The backend verifies Google Identity Services credentials using
+`GOOGLE_CLIENT_ID`; this code does not use a Google client secret or a
+redirect-URI flow. Keep `AUTH_SECRET_KEY`, `DATABASE_URL`, and Mailgun values
+only in the backend's environment settings.
+
 ## Configure payments
-Edit `backend/.env`.
+The payment-provider configuration below is a legacy reference and is not
+read by the current backend. Adding those variables will not enable live
+payment processing; orders remain pending until payment processing is
+implemented and configured.
 
 ## Configure Google sign-in
 1. Create a **Web application** OAuth client in Google Cloud Console.
